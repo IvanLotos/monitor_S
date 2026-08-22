@@ -1,0 +1,43 @@
+prefix: "http"
+secrets_file: "/etc/s/secrets.yaml"
+max_workers: 20
+log_level: "summary"   # full, summary, errors
+defaults:
+  timeout: 3
+  method: "GET"
+  expected_status: 200
+  ssl: auto
+  check_content: null
+  headers: {}
+endpoints:
+  # 1. FluentBit – GET /health, HTTP, без авторизации
+  - host: "fluentbit-host.example.com"
+    port: 2020
+    path: "/health"
+    expected_status: 200
+    check_content: "OK"
+    # ssl: auto → HTTP, т.к. порт 2020
+    # auth_ref не указан – без авторизации
+  # 2. Jolokia – POST /console/jolokia, HTTPS, с авторизацией, Origin, тело JSON
+  - host: "jolokia-host.example.com"
+    port: 8161
+    path: "/console/jolokia"
+    method: "POST"
+    ssl: true
+    auth_ref: "jolokia_creds"
+    headers:
+      Origin: "https://jolokia-host.example.com:8161"
+      Content-Type: "application/json"
+    body: '{"type":"read","mbean":"java.lang:type=Memory","attribute":"HeapMemoryUsage"}'
+    expected_status: 200
+    check_content: "used"
+    timeout: 5
+    log_level: "full"   # для отладки
+  # 3. Дополнительный пример – GET с авторизацией через Basic Auth (явно, без секретов)
+  - host: "some-host.example.com"
+    port: 8080
+    path: "/api/status"
+    auth_user: "testuser"
+    auth_password: "testpass"   # можно через $VAR, но лучше через секреты
+    expected_status: [200, 204]
+    check_content: "success"

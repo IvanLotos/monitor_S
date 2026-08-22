@@ -1,0 +1,16 @@
+prefix: "dns"
+hosts:
+#Балансировщик
+  - fqdn: "VVV-X9901AAA.my.company.com"
+    ip: "10.200.33.111"
+  - fqdn: "VVV-X9902AAA.my.company.com"
+    ip: "10.200.33.112"
+#Брокер
+  - fqdn: "VVV-X9901BBB.my.company.com"
+    ip: "10.200.33.113"
+
+#Прикладные
+  - fqdn: "VVV-X9901CCC.my.company.com"
+    ip: "10.200.33.133"
+
+timeout: 5

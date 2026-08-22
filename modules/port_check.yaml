@@ -1,0 +1,26 @@
+prefix: portcheck
+hosts:
+- host: hostname1.my.company.com
+  ports:
+  - 22
+  - 2020
+  - 9100
+  - 9200
+  - 9256
+  - 7070   # debug
+
+- host: hostname2.my.company.com
+  ports:
+  - 22
+  - 2020       # fluentbit
+  - 3000       # Grafana
+  - 5601       # OpenSearch dashboard
+  - 8443       # Apache, АРМ ядра
+  - 9090       # Prometheus. WEB,API /status, /api/v1/query
+  - 9093       # 
+  - 9094       # Prometheus alert manager, но сейчас используем возможности графаны.
+  - 9100       # node exporter
+  - 9115       # Blackbox Exporter
+  - 9145       # kafka-kminion-exporter on localhost
+  - 9256
+

@@ -1,0 +1,8 @@
+prefix: "portcheck"
+hosts:
+  - host: "ims-g201AQL"
+    ports: [22, 2020, 9100, 9200, 9256]
+  - host: "ims-g202KFL"
+    ports: [22, 2020, 9100]
+timeout: 3
+max_workers: 20

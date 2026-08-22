@@ -1,0 +1,2 @@
+key_name: "completion_time"
+time_format: "%d-%m-%Y %H:%M:%S"   # пример пользовательского формата
