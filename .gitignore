@@ -4,3 +4,4 @@ venv/
 .env
 tools/
 doc/ai-source/
+project_context.txt
