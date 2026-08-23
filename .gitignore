@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 venv/
 .env
+context.py
+context0.py
+AI-docs/src/

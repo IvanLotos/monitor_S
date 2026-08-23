@@ -1,0 +1,1299 @@
+
+==================== FILE: ./.gitignore ====================
+__pycache__/
+*.pyc
+venv/
+.env
+
+==================== FILE: ./src/config.yaml ====================
+host: "0.0.0.0"
+port: 8080
+server:
+  max_workers: 20
+cache:
+  refresh_interval: 60
+modules_dir: "./modules"
+module_timeout: 30
+logging:
+  level: DEBUG                 # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  file: "logs/server.log"     # опционально, если не указан — вывод в консоль
+  max_bytes: 10485760         # 10 МБ
+  backup_count: 5
+  module_levels:              # переопределение для конкретных модулей
+    dns_check: DEBUG
+    port_check: DEBUG
+
+
+==================== FILE: ./src/server.py ====================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import os
+import re
+ 
+import json
+import yaml
+import importlib.util
+import sys
+import logging
+import logging.config
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+import threading
+import time
+import copy
+from datetime import datetime
+import socket
+import concurrent.futures
+import socketserver
+ 
+import requests
+from requests.auth import HTTPBasicAuth
+import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urlparse
+# Подавление предупреждений о небезопасных HTTPS-запросах
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)  # <-- Добавить эту строку
+ 
+ 
+VERSION = "2.0.1"
+MODULES = {}
+GLOBAL_CONFIG = {}
+CACHE = {}
+CACHE_LOCK = threading.RLock()
+CACHE_TIMESTAMP = None
+HOSTNAME = socket.gethostname()
+STOP_BACKGROUND = False
+# ----------------------------------------------------------------------
+# Настройка логирования
+# ----------------------------------------------------------------------
+def setup_logging(config: dict) -> None:
+   log_cfg = config.get('logging', {})
+   level = getattr(logging, log_cfg.get('level', 'INFO').upper())
+   log_format = log_cfg.get('format', '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+   datefmt = log_cfg.get('datefmt', '%Y-%m-%d %H:%M:%S')
+ 
+   handlers = []
+   if 'file' in log_cfg:
+       from logging.handlers import RotatingFileHandler
+       log_file = log_cfg['file']
+       Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+       file_handler = RotatingFileHandler(
+           log_file,
+           maxBytes=log_cfg.get('max_bytes', 10485760),
+           backupCount=log_cfg.get('backup_count', 5)
+       )
+       file_handler.setFormatter(logging.Formatter(log_format, datefmt))
+       handlers.append(file_handler)
+   else:
+       console_handler = logging.StreamHandler()
+       console_handler.setFormatter(logging.Formatter(log_format, datefmt))
+       handlers.append(console_handler)
+ 
+   logging.basicConfig(level=level, handlers=handlers)
+ 
+   for mod, lvl in log_cfg.get('module_levels', {}).items():
+       logging.getLogger(mod).setLevel(getattr(logging, lvl.upper()))
+ 
+   logging.info("Logging configured")
+ 
+# ----------------------------------------------------------------------
+# Загрузка модулей
+# ----------------------------------------------------------------------
+def load_modules(modules_dir: str, global_config: dict) -> dict:
+   modules = {}
+   modules_path = Path(modules_dir)
+   if not modules_path.exists():
+       logging.warning(f"Modules directory '{modules_dir}' does not exist, creating")
+       modules_path.mkdir(parents=True)
+ 
+   for py_file in modules_path.glob('*.py'):
+       if py_file.stem.startswith('_'):
+           continue
+       try:
+           spec = importlib.util.spec_from_file_location(py_file.stem, py_file)
+           module = importlib.util.module_from_spec(spec)
+           spec.loader.exec_module(module)
+           if not hasattr(module, 'run'):
+               logging.warning(f"Module {py_file.stem} has no 'run' function, skipping")
+               continue
+ 
+           version = getattr(module, 'VERSION', 'unknown')
+           config_file = py_file.with_suffix('.yaml')
+           if not config_file.exists():
+                config_file = py_file.with_suffix('.json')
+           config = {}
+           if config_file.exists():
+               with open(config_file, 'r', encoding='utf-8') as f:
+                   if config_file.suffix == '.yaml':
+                       config = yaml.safe_load(f) or {}
+                   else:
+                       config = json.load(f) or {}
+           else:
+               logging.warning(f"Config file for module {py_file.stem} not found, using empty config")
+ 
+            module_name = py_file.stem.replace('_', '')
+           modules[module_name] = {
+               'run': module.run,
+               'config': config,
+               'version': version,
+               'config_path': str(config_file) if config_file.exists() else None,
+               'original_name': py_file.stem
+           }
+           logging.info(f"Loaded module: {module_name} (from {py_file.stem}, version {version})")
+       except Exception as e:
+           logging.error(f"Failed to load module {py_file.stem}: {e}", exc_info=True)
+ 
+   return modules
+ 
+# ----------------------------------------------------------------------
+# Выполнение модулей с таймаутом
+# ----------------------------------------------------------------------
+def run_module_with_timeout(module_func, config, timeout):
+   with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+       future = executor.submit(module_func, config)
+       try:
+           result = future.result(timeout=timeout)
+           return result if isinstance(result, dict) else {}
+       except concurrent.futures.TimeoutError:
+           logging.error(f"Module execution timed out after {timeout}s")
+           return {}
+       except Exception as e:
+           logging.error(f"Module execution failed: {e}")
+           return {}
+ 
+def collect_results_from_modules(module_names=None):
+   timeout = GLOBAL_CONFIG.get('module_timeout', 30)
+   merged = {}
+   if module_names is None:
+       modules_to_run = MODULES.items()
+   else:
+       modules_to_run = [(name, MODULES[name]) for name in module_names if name in MODULES]
+ 
+   for module_name, module_info in modules_to_run:
+       try:
+           result = run_module_with_timeout(module_info['run'], module_info['config'], timeout)
+           if not isinstance(result, dict):
+               logging.warning(f"Module {module_name} returned non-dict, skipped")
+               continue
+           for k, v in result.items():
+               if k in merged:
+                    logging.warning(f"Key '{k}' already exists, overwriting from {module_name}")
+               merged[k] = v
+           logging.info(f"Module {module_name} returned {len(result)} keys")
+       except Exception as e:
+           logging.error(f"Module {module_name} failed: {e}", exc_info=True)
+   return merged
+ 
+# ----------------------------------------------------------------------
+# Управление кэшем
+# ----------------------------------------------------------------------
+def update_cache():
+   global CACHE, CACHE_TIMESTAMP
+   logging.info("Starting cache update")
+   module_names = [name for name in MODULES.keys() if name != 'gettime']
+   merged = collect_results_from_modules(module_names)
+ 
+   if 'gettime' in MODULES:
+       try:
+           gettime_result = run_module_with_timeout(
+               MODULES['gettime']['run'],
+               MODULES['gettime']['config'],
+               GLOBAL_CONFIG.get('module_timeout', 30)
+           )
+           for k, v in gettime_result.items():
+               if k in merged:
+                   logging.warning(f"Key '{k}' already exists, overwriting with gettime")
+               merged[k] = v
+       except Exception as e:
+           logging.error(f"Failed to run gettime: {e}")
+ 
+   new_cache = {'timestamp': datetime.now().isoformat()}
+   for key, value in merged.items():
+       parts = key.split('.')
+       if len(parts) == 1:
+           new_cache[parts[0]] = value
+       elif len(parts) == 2:
+           op, host = parts
+           new_cache.setdefault(op, {})[host] = value
+       else:
+           op = parts[0]
+           host = '.'.join(parts[1:-1])
+           port = parts[-1]
+           new_cache.setdefault(op, {}).setdefault(host, {})[port] = value
+ 
+   with CACHE_LOCK:
+       CACHE = new_cache
+       CACHE_TIMESTAMP = new_cache['timestamp']
+   logging.info(f"Cache updated successfully at {CACHE_TIMESTAMP}")
+ 
+# ----------------------------------------------------------------------
+# Фоновая задача
+# ----------------------------------------------------------------------
+def background_worker(refresh_interval):
+   logging.info("Background worker started")
+   while not STOP_BACKGROUND:
+       time.sleep(refresh_interval)
+       if STOP_BACKGROUND:
+           break
+       try:
+           with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+               future = executor.submit(update_cache)
+               future.result(timeout=GLOBAL_CONFIG.get('module_timeout', 30) * 2)
+       except concurrent.futures.TimeoutError:
+           logging.error("Cache update timed out in background worker")
+       except Exception as e:
+           logging.error(f"Background update failed: {e}", exc_info=True)
+   logging.info("Background worker stopped")
+ 
+# ----------------------------------------------------------------------
+# HTTP-сервер (многопоточный)
+# ----------------------------------------------------------------------
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+   daemon_threads = True
+   def __init__(self, server_address, RequestHandlerClass, max_workers=20):
+       self.max_workers = max_workers
+       self.semaphore = threading.Semaphore(max_workers)
+       super().__init__(server_address, RequestHandlerClass)
+ 
+   def process_request(self, request, client_address):
+       self.semaphore.acquire()
+       try:
+           super().process_request(request, client_address)
+       finally:
+           self.semaphore.release()
+ 
+class SHandler_backup(BaseHTTPRequestHandler):
+   # ---------- Основные методы ----------
+   def do_GET(self):
+       self.handle_request()
+ 
+   def do_POST(self):
+       self.handle_request()
+ 
+   def do_OPTIONS(self):
+       self.send_response(200)
+       self.send_header('Access-Control-Allow-Origin', '*')
+       self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+       self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+       self.end_headers()
+ 
+   def handle_request_0(self):
+       logging.info(f"Request: {self.command} {self.path}")
+       path = self.path
+ 
+       if path == '/':
+           self.handle_root()
+       elif path == '/v2':
+           self.handle_v2()
+       elif path.startswith('/v3/'):
+           parts = path.split('/')
+           if len(parts) == 2:          # /v3
+               self.handle_v3()
+           elif len(parts) == 3:        # /v3/{operation}
+               operation = parts[2]
+                self.handle_v3_with_operation(operation)
+           elif len(parts) >= 4:        # /v3/{operation}/{groups}
+               operation = parts[2]
+               groups_str = '/'.join(parts[3:])
+               self.handle_v3_with_groups(operation, groups_str)
+           else:
+               self.send_error(404, "Not Found")
+       elif path == '/refresh':
+           self.handle_refresh()
+       else:
+           self.send_error(404, "Not Found")
+ 
+ 
+   def handle_request(self):
+       logging.info(f"Request: {self.command} {self.path}")
+       path = self.path.rstrip('/')  # удаляем завершающий слеш для единообразия
+     
+       if path == '/':
+           self.handle_root()
+       elif path == '/v2':
+            self.handle_v2()
+       elif path == '/v3':
+           self.handle_v3()
+       elif path.startswith('/v3/'):
+           parts = path.split('/')
+           if len(parts) == 3:          # /v3/{operation}
+               operation = parts[2]
+               self.handle_v3_with_operation(operation)
+           elif len(parts) >= 4:        # /v3/{operation}/{groups}
+               operation = parts[2]
+               groups_str = '/'.join(parts[3:])
+               self.handle_v3_with_groups(operation, groups_str)
+           else:
+               self.send_error(404, "Not Found")
+       elif path == '/refresh':
+           self.handle_refresh()
+       else:
+           self.send_error(404, "Not Found")
+    
+ 
+   def handle_refresh(self):
+       if self.command not in ('GET', 'POST'):
+           self.send_error(405, "Method Not Allowed")
+           return
+       try:
+           update_cache()
+           self.send_json_response({"status": "ok", "timestamp": CACHE_TIMESTAMP})
+       except Exception as e:
+           logging.error(f"Refresh failed: {e}", exc_info=True)
+           self.send_error(500, f"Refresh failed: {e}")
+ 
+   # ---------- Обработчики GET (все читают кэш) ----------
+   def handle_root(self):
+        with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy:
+           self.send_json_response([])
+           return
+       response = []
+       for op, op_data in cache_copy.items():
+           if op == 'timestamp':
+                continue
+           if isinstance(op_data, dict):
+               for host, value in op_data.items():
+                   if isinstance(value, dict):
+                       for port, port_value in value.items():
+                           response.append({f"{op}.{host}.{port}": port_value})
+                   else:
+                       response.append({f"{op}.{host}": value})
+           else:
+               response.append({op: op_data})
+       self.send_json_response(response)
+ 
+   def handle_v2(self):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy:
+           self.send_json_response([])
+           return
+       grouped = []
+       for op, op_data in cache_copy.items():
+           if op == 'timestamp':
+               continue
+           if isinstance(op_data, dict):
+               for host, value in op_data.items():
+                   grouped.append({"operation": op, "host": host, "value": value})
+           else:
+               grouped.append({"operation": op, "host": HOSTNAME, "value": op_data})
+       self.send_json_response(grouped)
+ 
+   def handle_v3(self):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy:
+           self.send_json_response([])
+           return
+       response = []
+       for op, op_data in cache_copy.items():
+           if op == 'timestamp':
+               continue
+           if isinstance(op_data, dict):
+               for host, value in op_data.items():
+                   if isinstance(value, dict):
+                       for port, port_value in value.items():
+                           response.append({
+                                "operation": op,
+                               "host": host,
+                               "value": port_value,
+                               "port": str(port)
+                           })
+                   else:
+                       response.append({"operation": op, "host": host, "value": value})
+           else:
+               response.append({"operation": op, "host": HOSTNAME, "value": op_data})
+       self.send_json_response(response)
+ 
+   def handle_v3_with_operation(self, operation):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy or operation not in cache_copy:
+           self.send_json_response([])
+           return
+       op_data = cache_copy[operation]
+       response = []
+       if isinstance(op_data, dict):
+           for host, value in op_data.items():
+               if isinstance(value, dict):
+                   for port, port_value in value.items():
+                       response.append({
+                            "operation": operation,
+                           "host": host,
+                           "value": port_value,
+                           "port": str(port)
+                       })
+               else:
+                   response.append({"operation": operation, "host": host, "value": value})
+       else:
+           response.append({"operation": operation, "host": HOSTNAME, "value": op_data})
+       self.send_json_response(response)
+ 
+   def handle_v3_with_groups(self, operation, groups_str):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy or operation not in cache_copy:
+           self.send_json_response([])
+           return
+ 
+       groups = [g.strip().upper() for g in groups_str.split(',') if g.strip()]
+       if not groups:
+           self.send_error(400, "Bad Request: empty groups")
+           return
+       if len(groups) > 10:
+           self.send_error(400, "Bad Request: too many groups (max 10)")
+           return
+ 
+       op_data = cache_copy[operation]
+       if not isinstance(op_data, dict):
+           self.send_json_response([])
+           return
+ 
+       # Фильтрация: ищем вхождение любой группы в первом лейбле (без учёта регистра)
+       filtered = {}
+       for host_key, value in op_data.items():
+           first_label = host_key.split('.')[0] if '.' in host_key else host_key
+           upper_label = first_label.upper()
+           if any(g in upper_label for g in groups):
+                filtered[host_key] = value
+ 
+       if not filtered:
+           self.send_json_response([])
+           return
+ 
+       response = []
+       for host_key, value in filtered.items():
+           if isinstance(value, dict):
+                for port, port_value in value.items():
+                   response.append({
+                       "operation": operation,
+                       "host": host_key,
+                       "value": port_value,
+                       "port": str(port)
+                   })
+           else:
+               response.append({"operation": operation, "host": host_key, "value": value})
+       self.send_json_response(response)
+ 
+   # ---------- Вспомогательные ----------
+   def send_json_response(self, data):
+       response_json = json.dumps(data, ensure_ascii=False, indent=None)
+       self.send_response(200)
+       self.send_header('Content-Type', 'application/json')
+       self.send_header('Access-Control-Allow-Origin', '*')
+       self.send_header('Content-Length', str(len(response_json.encode('utf-8'))))
+       self.end_headers()
+       self.wfile.write(response_json.encode('utf-8'))
+ 
+ 
+class SHandler(BaseHTTPRequestHandler):
+   # ---------- Основные методы ----------
+   def do_GET(self):
+        self.handle_request()
+ 
+   def do_POST(self):
+       self.handle_request()
+ 
+   def do_OPTIONS(self):
+       self.send_response(200)
+       self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+       self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+       self.end_headers()
+ 
+   def handle_request(self):
+       logging.info(f"Request: {self.command} {self.path}")
+       path = self.path.rstrip('/')   # удаляем завершающий слеш
+ 
+       if path == '' or path == '/':
+           self.handle_root()
+       elif path == '/v2':
+           self.handle_v2()
+       elif path == '/v3':
+           self.handle_v3()
+       elif path.startswith('/v3/'):
+           parts = path.split('/')
+           if len(parts) == 3:          # /v3/{operation}
+               operation = parts[2]
+               self.handle_v3_with_operation(operation)
+           elif len(parts) >= 4:        # /v3/{operation}/{groups}
+               operation = parts[2]
+               groups_str = '/'.join(parts[3:])
+               self.handle_v3_with_groups(operation, groups_str)
+           else:
+               self.send_error(404, "Not Found")
+       elif path == '/refresh':
+           self.handle_refresh()
+       else:
+           self.send_error(404, "Not Found")
+ 
+   # ---------- Обработчики ----------
+   def handle_root(self):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy:
+           self.send_json_response([])
+           return
+       response = []
+       for op, op_data in cache_copy.items():
+           if op == 'timestamp':
+                continue
+           if isinstance(op_data, dict):
+               for host, value in op_data.items():
+                   if isinstance(value, dict):
+                       for port, port_value in value.items():
+                           response.append({f"{op}.{host}.{port}": port_value})
+                   else:
+                       response.append({f"{op}.{host}": value})
+           else:
+               response.append({op: op_data})
+       self.send_json_response(response)
+ 
+    def handle_v2(self):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy:
+           self.send_json_response([])
+           return
+       grouped = []
+       for op, op_data in cache_copy.items():
+            if op == 'timestamp':
+               continue
+           if isinstance(op_data, dict):
+               for host, value in op_data.items():
+                   grouped.append({"operation": op, "host": host, "value": value})
+           else:
+               grouped.append({"operation": op, "host": HOSTNAME, "value": op_data})
+       self.send_json_response(grouped)
+ 
+   def handle_v3(self):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy:
+           self.send_json_response([])
+           return
+       response = []
+       for op, op_data in cache_copy.items():
+           if op == 'timestamp':
+               continue
+           if isinstance(op_data, dict):
+               for host, value in op_data.items():
+                   if isinstance(value, dict):
+                       for port, port_value in value.items():
+                           response.append({
+                               "operation": op,
+                                "host": host,
+                               "value": port_value,
+                               "port": str(port)
+                           })
+                   else:
+                       response.append({"operation": op, "host": host, "value": value})
+           else:
+               response.append({"operation": op, "host": HOSTNAME, "value": op_data})
+       self.send_json_response(response)
+ 
+   def handle_v3_with_operation(self, operation):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy or operation not in cache_copy:
+           self.send_json_response([])
+           return
+        op_data = cache_copy[operation]
+       response = []
+       if isinstance(op_data, dict):
+           for host, value in op_data.items():
+               if isinstance(value, dict):
+                   for port, port_value in value.items():
+                        response.append({
+                           "operation": operation,
+                           "host": host,
+                           "value": port_value,
+                           "port": str(port)
+                       })
+               else:
+                   response.append({"operation": operation, "host": host, "value": value})
+       else:
+           response.append({"operation": operation, "host": HOSTNAME, "value": op_data})
+       self.send_json_response(response)
+ 
+   def handle_v3_with_groups(self, operation, groups_str):
+       with CACHE_LOCK:
+           cache_copy = copy.deepcopy(CACHE)
+       if not cache_copy or operation not in cache_copy:
+           self.send_json_response([])
+           return
+ 
+       groups = [g.strip().upper() for g in groups_str.split(',') if g.strip()]
+       if not groups:
+           self.send_error(400, "Bad Request: empty groups")
+           return
+       if len(groups) > 10:
+           self.send_error(400, "Bad Request: too many groups (max 10)")
+           return
+ 
+       op_data = cache_copy[operation]
+       if not isinstance(op_data, dict):
+           self.send_json_response([])
+           return
+ 
+       # Фильтрация: поиск подстроки в первом лейбле (без учёта регистра)
+       filtered = {}
+       for host_key, value in op_data.items():
+           first_label = host_key.split('.')[0] if '.' in host_key else host_key
+           upper_label = first_label.upper()
+            if any(g in upper_label for g in groups):
+               filtered[host_key] = value
+ 
+       if not filtered:
+           self.send_json_response([])
+           return
+ 
+       response = []
+       for host_key, value in filtered.items():
+           if isinstance(value, dict):
+               for port, port_value in value.items():
+                   response.append({
+                       "operation": operation,
+                       "host": host_key,
+                       "value": port_value,
+                        "port": str(port)
+                   })
+           else:
+               response.append({"operation": operation, "host": host_key, "value": value})
+       self.send_json_response(response)
+ 
+   def handle_refresh(self):
+       if self.command not in ('GET', 'POST'):
+           self.send_error(405, "Method Not Allowed")
+           return
+       try:
+           update_cache()
+           self.send_json_response({"status": "ok", "timestamp": CACHE_TIMESTAMP})
+       except Exception as e:
+           logging.error(f"Refresh failed: {e}", exc_info=True)
+           self.send_error(500, f"Refresh failed: {e}")
+ 
+   # ---------- Вспомогательные ----------
+   def send_json_response(self, data):
+       response_json = json.dumps(data, ensure_ascii=False, indent=None)
+       self.send_response(200)
+       self.send_header('Content-Type', 'application/json')
+       self.send_header('Access-Control-Allow-Origin', '*')
+       self.send_header('Content-Length', str(len(response_json.encode('utf-8'))))
+       self.end_headers()
+       self.wfile.write(response_json.encode('utf-8'))
+ 
+ 
+# ----------------------------------------------------------------------
+# Запуск
+# ----------------------------------------------------------------------
+def print_startup_info():
+   print(f"S server version: {VERSION}")
+   config_path = Path('config.yaml').absolute()
+   print(f"Main config file: {config_path}")
+   print(f"Hostname: {HOSTNAME}")
+   print("Loaded modules:")
+   if MODULES:
+       for name, info in MODULES.items():
+           cfg = info['config_path'] if info['config_path'] else 'No config file'
+            print(f"  - {name} (version {info['version']}, from {info['original_name']}) -> config: {cfg}")
+   else:
+       print("  No modules loaded")
+   refresh = GLOBAL_CONFIG.get('cache', {}).get('refresh_interval', 60)
+   timeout = GLOBAL_CONFIG.get('module_timeout', 30)
+   max_workers = GLOBAL_CONFIG.get('server', {}).get('max_workers', 20)
+   print(f"Cache refresh interval: {refresh} seconds")
+   print(f"Module execution timeout: {timeout} seconds")
+   print(f"Max parallel requests: {max_workers}")
+   print("-" * 60)
+ 
+def main():
+   global GLOBAL_CONFIG, MODULES, STOP_BACKGROUND
+ 
+   config_file = Path('config.yaml')
+   if not config_file.exists():
+       print("Error: config.yaml not found")
+       sys.exit(1)
+ 
+   with open(config_file, 'r', encoding='utf-8') as f:
+       GLOBAL_CONFIG = yaml.safe_load(f) or {}
+ 
+   setup_logging(GLOBAL_CONFIG)
+ 
+   modules_dir = GLOBAL_CONFIG.get('modules_dir', './modules')
+   MODULES = load_modules(modules_dir, GLOBAL_CONFIG)
+ 
+   print_startup_info()
+ 
+   refresh_interval = GLOBAL_CONFIG.get('cache', {}).get('refresh_interval', 60)
+   threading.Thread(target=update_cache, daemon=True).start()
+ 
+   bg_thread = threading.Thread(target=background_worker, args=(refresh_interval,), daemon=True)
+   bg_thread.start()
+ 
+   host = GLOBAL_CONFIG.get('host', '0.0.0.0')
+   port = GLOBAL_CONFIG.get('port', 8080)
+   max_workers = GLOBAL_CONFIG.get('server', {}).get('max_workers', 20)
+   server = ThreadedHTTPServer((host, port), SHandler, max_workers)
+   logging.info(f"Starting S server on {host}:{port}")
+   print(f"Server is running on {host}:{port} (press Ctrl+C to stop)")
+   print("Available endpoints:")
+   print("  /           - legacy format (reads cache)")
+   print("  /v2         - grouped by host (reads cache)")
+   print("  /v3         - separate records (reads cache)")
+   print("  /v3/{op}    - operation filter (reads cache)")
+   print("  /v3/{op}/{groups} - operation + group filter (reads cache)")
+   print("  /refresh    - force cache update (GET or POST)")
+   try:
+       server.serve_forever()
+   except KeyboardInterrupt:
+       logging.info("Server stopped by user")
+       STOP_BACKGROUND = True
+       bg_thread.join(timeout=2)
+       print("\nServer stopped.")
+   finally:
+       server.server_close()
+ 
+if __name__ == '__main__':
+   main()
+
+==================== FILE: ./src/modules/port_check.py ====================
+import socket
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+VERSION = "1.0.0"
+logger = logging.getLogger(__name__)
+def _check_single(host: str, port: int, timeout: float, key: str):
+   try:
+       with socket.create_connection((host, port), timeout=timeout):
+           return key, True
+   except Exception as e:
+       logger.debug(f"{key} failed: {e}")
+       return key, False
+ 
+def run(config: dict) -> dict:
+   prefix = config.get('prefix', 'portcheck')
+   hosts_config = config.get('hosts', [])
+   timeout = config.get('timeout', 3)
+   max_workers = config.get('max_workers', 30)
+ 
+   logger.info(f"Starting port check with {len(hosts_config)} hosts, max_workers={max_workers}")
+ 
+   tasks = []
+   for entry in hosts_config:
+       if isinstance(entry, dict):
+           host = entry.get('host')
+           ports = entry.get('ports', [])
+       else:
+           host = entry
+           ports = config.get('ports', [])   # fallback
+       if not host or not ports:
+           continue
+       first_word = host.split('.')[0] if '.' in host else host
+       for port in ports:
+           key = f"{prefix}.{first_word}.{port}"
+           tasks.append((host, port, timeout, key))
+ 
+   results = {}
+   if tasks:
+       with ThreadPoolExecutor(max_workers=max_workers) as executor:
+           future_to_key = {
+               executor.submit(_check_single, host, port, timeout, key): key
+               for host, port, timeout, key in tasks
+           }
+           for future in as_completed(future_to_key):
+               key = future_to_key[future]
+               try:
+                    _, success = future.result()
+                   results[key] = success
+               except Exception as e:
+                   logger.error(f"Unexpected error for {key}: {e}")
+                   results[key] = False
+ 
+   logger.info(f"Port check finished, {len(results)} results")
+   return results
+
+==================== FILE: ./src/modules/port_check.yaml ====================
+prefix: portcheck
+hosts:
+- host: hostname1.my.company.com
+  ports:
+  - 22
+  - 2020
+  - 9100
+  - 9200
+  - 9256
+  - 7070   # debug
+
+- host: hostname2.my.company.com
+  ports:
+  - 22
+  - 2020       # fluentbit
+  - 3000       # Grafana
+  - 5601       # OpenSearch dashboard
+  - 8443       # Apache, АРМ ядра
+  - 9090       # Prometheus. WEB,API /status, /api/v1/query
+  - 9093       # 
+  - 9094       # Prometheus alert manager, но сейчас используем возможности графаны.
+  - 9100       # node exporter
+  - 9115       # Blackbox Exporter
+  - 9145       # kafka-kminion-exporter on localhost
+  - 9256
+
+
+==================== FILE: ./src/modules/http_check.yaml ====================
+prefix: "http"
+secrets_file: "/etc/s/secrets.yaml"
+max_workers: 20
+log_level: "summary"   # full, summary, errors
+defaults:
+  timeout: 3
+  method: "GET"
+  expected_status: 200
+  ssl: auto
+  check_content: null
+  headers: {}
+endpoints:
+  # 1. FluentBit – GET /health, HTTP, без авторизации
+  - host: "fluentbit-host.example.com"
+    port: 2020
+    path: "/health"
+    expected_status: 200
+    check_content: "OK"
+    # ssl: auto → HTTP, т.к. порт 2020
+    # auth_ref не указан – без авторизации
+  # 2. Jolokia – POST /console/jolokia, HTTPS, с авторизацией, Origin, тело JSON
+  - host: "jolokia-host.example.com"
+    port: 8161
+    path: "/console/jolokia"
+    method: "POST"
+    ssl: true
+    auth_ref: "jolokia_creds"
+    headers:
+      Origin: "https://jolokia-host.example.com:8161"
+      Content-Type: "application/json"
+    body: '{"type":"read","mbean":"java.lang:type=Memory","attribute":"HeapMemoryUsage"}'
+    expected_status: 200
+    check_content: "used"
+    timeout: 5
+    log_level: "full"   # для отладки
+  # 3. Дополнительный пример – GET с авторизацией через Basic Auth (явно, без секретов)
+  - host: "some-host.example.com"
+    port: 8080
+    path: "/api/status"
+    auth_user: "testuser"
+    auth_password: "testpass"   # можно через $VAR, но лучше через секреты
+    expected_status: [200, 204]
+    check_content: "success"
+
+==================== FILE: ./src/modules/gettime.yaml ====================
+key_name: "completion_time"
+time_format: "%d-%m-%Y %H:%M:%S"   # пример пользовательского формата
+
+==================== FILE: ./src/modules/dns_check.py ====================
+import socket
+import logging
+VERSION = "1.0.0"
+logger = logging.getLogger(__name__)
+def run(config: dict) -> dict:
+   prefix = config.get('prefix', 'dns')
+   hosts = config.get('hosts', [])
+   timeout = config.get('timeout', 5)
+   results = {}
+ 
+   logger.info(f"Starting DNS check for {len(hosts)} hosts")
+ 
+   for entry in hosts:
+       fqdn = entry.get('fqdn')
+       expected_ip = entry.get('ip')
+       if not fqdn or not expected_ip:
+           logger.warning(f"Skipping invalid entry: {entry}")
+           continue
+ 
+       first_word = fqdn.split('.')[0] if '.' in fqdn else fqdn
+       key = f"{prefix}.{first_word}"
+ 
+       try:
+           resolved_ips = socket.gethostbyname_ex(fqdn)[2]
+           is_correct = expected_ip in resolved_ips
+           logger.debug(f"{fqdn} -> {resolved_ips}, expected {expected_ip}: {is_correct}")
+       except socket.gaierror:
+           logger.debug(f"{fqdn} could not be resolved")
+           is_correct = False
+       except Exception as e:
+           logger.error(f"Unexpected error for {fqdn}: {e}")
+           is_correct = False
+ 
+       results[key] = is_correct
+ 
+   logger.info(f"DNS check finished, {len(results)} results")
+   return results
+ 
+
+
+==================== FILE: ./src/modules/gettime.py ====================
+from datetime import datetime
+
+import logging
+
+ 
+
+VERSION = "1.0.0"
+
+logger = logging.getLogger(__name__)
+
+ 
+
+def run(config: dict) -> dict:
+
+    """
+
+    Возвращает текущее время в заданном формате.
+
+    Параметры конфига:
+
+        key_name: имя ключа (по умолчанию 'timestamp')
+
+        time_format: строка формата strftime (по умолчанию ISO8601: '%Y-%m-%dT%H:%M:%S')
+
+    """
+
+    key_name = config.get('key_name', 'timestamp')
+
+    time_format = config.get('time_format', '%Y-%m-%dT%H:%M:%S')  # ISO8601 без timezone
+
+    now = datetime.now()
+
+    time_str = now.strftime(time_format)
+
+    logger.info(f"Current time: {time_str}")
+
+    return {key_name: time_str}
+
+ 
+
+ 
+
+ 
+
+
+
+==================== FILE: ./src/modules/dummy.py ====================
+import logging
+
+VERSION = "1.0.0"
+
+logger = logging.getLogger(__name__)
+
+def run(config: dict) -> dict:
+
+    """
+
+    Генерирует заданное число строк key-value.
+
+    Параметры конфига:
+
+        prefix: префикс для ключей (по умолчанию 'dummy')
+
+        count: количество генерируемых записей (по умолчанию 5)
+
+        value_template: шаблон значения (по умолчанию 'dummy_value')
+
+    Ключи имеют вид: {prefix}.{index}, где index начинается с 1.
+
+    """
+
+    prefix = config.get('prefix', 'dummy')
+
+    count = config.get('count', 5)
+
+    value_template = config.get('value_template', 'dummy_value')
+
+    logger.info(f"Generating {count} dummy records with prefix '{prefix}'")
+
+    result = {}
+
+    for i in range(1, count + 1):
+
+        key = f"{prefix}.{i}"
+
+        value = f"{value_template}_{i}"
+
+        result[key] = value
+
+    logger.info(f"Generated {len(result)} dummy keys")
+
+    return result
+
+
+==================== FILE: ./src/modules/dummy.yaml ====================
+prefix: "dummy"
+count: 10
+value_template: "test_data"
+
+==================== FILE: ./src/modules/http_check.py ====================
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Модуль HTTP/HTTPS проверки для сервера S.
+Поддерживает GET/POST, Basic Auth, кастомные заголовки, проверку статуса и содержимого,
+логирование с тремя уровнями (full/summary/errors), параллельное выполнение.
+Версия: 1.0.0
+"""
+import os
+import re
+import yaml
+import json
+import logging
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.auth import HTTPBasicAuth
+from urllib.parse import urlparse
+VERSION = "1.0.0"
+logger = logging.getLogger(__name__)
+def resolve_env(value):
+   """Заменяет значения вида $VAR на переменные окружения."""
+   if isinstance(value, str) and value.startswith('$'):
+       env_var = value[1:]
+       return os.getenv(env_var, value)
+   return value
+def normalize_path(path):
+   """
+   Нормализует путь для использования в ключе:
+   - удаляет query-параметры (всё после '?')
+   - удаляет завершающий слеш (кроме корневого)
+   - заменяет '/' на '_'
+   - оставляет только буквы, цифры, '_', '-', '.'
+   """
+   if not path:
+       path = '/'
+   # Удаляем query
+   path = path.split('?')[0]
+   # Удаляем завершающий слеш, если есть и длина > 1
+   if len(path) > 1 and path.endswith('/'):
+       path = path.rstrip('/')
+   # Заменяем '/' на '_'
+   escaped = path.replace('/', '_')
+   # Оставляем только допустимые символы: буквы, цифры, _, -, .
+   cleaned = re.sub(r'[^a-zA-Z0-9_.-]', '', escaped)
+   if not cleaned:
+       cleaned = '_'
+   return cleaned
+def mask_secrets(text, secrets):
+   """Маскирует пароли и токены в тексте для логирования."""
+   if not secrets:
+       return text
+   masked = text
+   for secret in secrets:
+        if secret:
+           masked = masked.replace(secret, '***')
+   return masked
+def load_secrets(secrets_file):
+   """Загружает секреты из YAML-файла, возвращает словарь {ref: (user, password)}."""
+   if not secrets_file:
+       return {}
+   if not os.path.isfile(secrets_file):
+       logger.error(f"Secrets file not found: {secrets_file}")
+       return {}
+   try:
+       with open(secrets_file, 'r', encoding='utf-8') as f:
+           data = yaml.safe_load(f) or {}
+       secrets = {}
+       for ref, creds in data.items():
+           user = creds.get('user', '')
+           password = creds.get('password', '')
+           if user and password:
+               secrets[ref] = (user, password)
+           else:
+               logger.warning(f"Secret ref '{ref}' missing user or password, skipped")
+       return secrets
+   except Exception as e:
+       logger.error(f"Failed to load secrets file {secrets_file}: {e}")
+       return {}
+class HTTPChecker:
+   def __init__(self, config):
+       # Рекурсивно разрешаем переменные окружения в конфиге
+       self.config = self._resolve_env_in_config(config)
+       self.prefix = self.config.get('prefix', 'http')
+        self.secrets_file = self.config.get('secrets_file')
+       self.log_level = self.config.get('log_level', 'summary')
+       self.defaults = self.config.get('defaults', {})
+       self.endpoints = self.config.get('endpoints', [])
+       self.max_workers = self.config.get('max_workers', 20)
+       # Загружаем секреты
+       self.secrets = load_secrets(self.secrets_file)
+       if self.secrets_file and not self.secrets:
+           logger.warning("Secrets file specified but no secrets loaded")
+       # Логируем стартовую информацию
+       logger.info(f"HTTP module initialized with {len(self.endpoints)} endpoints, max_workers={self.max_workers}")
+   def _resolve_env_in_config(self, obj):
+       """Рекурсивно преобразует $VAR в переменные окружения."""
+       if isinstance(obj, dict):
+           return {k: self._resolve_env_in_config(v) for k, v in obj.items()}
+       elif isinstance(obj, list):
+           return [self._resolve_env_in_config(item) for item in obj]
+       else:
+           return resolve_env(obj)
+   def _get_auth(self, endpoint):
+       """Возвращает кортеж (HTTPBasicAuth или None, список паролей для маскировки)."""
+       auth_ref = endpoint.get('auth_ref')
+       auth_user = endpoint.get('auth_user')
+       auth_password = endpoint.get('auth_password')
+       secrets = []
+       if auth_ref:
+           if auth_ref in self.secrets:
+               user, password = self.secrets[auth_ref]
+               secrets.append(password)
+               return HTTPBasicAuth(user, password), secrets
+           else:
+               logger.error(f"auth_ref '{auth_ref}' not found in secrets")
+               return None, []
+       if auth_user and auth_password:
+           secrets.append(auth_password)
+           return HTTPBasicAuth(auth_user, auth_password), secrets
+       # Проверяем заголовок Authorization (если уже есть)
+       headers = endpoint.get('headers', {})
+       auth_header = headers.get('Authorization')
+       if auth_header and auth_header.startswith('Basic'):
+           # Маскируем весь заголовок
+           secrets.append(auth_header)
+       return None, secrets
+   def _log_request(self, endpoint, method, url, status, elapsed, response_text='',
+                    error=None, log_level_override=None):
+       """Логирует запрос в соответствии с уровнем."""
+       level = log_level_override or endpoint.get('log_level', self.log_level)
+       if level == 'errors' and error is None:
+           return  # не логируем успешные запросы
+       log_parts = [f"{method} {url} -> {status if status else 'ERROR'} ({elapsed:.3f}s)"]
+       if error:
+           log_parts.append(f"ERROR: {error}")
+       if level == 'full':
+           # Логируем заголовки (маскируем пароли)
+            headers = endpoint.get('headers', {})
+           # Собираем секреты для маскировки
+           _, secrets = self._get_auth(endpoint)
+           headers_str = ', '.join([f"{k}: {mask_secrets(v, secrets)}" for k, v in headers.items()])
+            log_parts.append(f"Headers: {headers_str}")
+           if response_text:
+               body_preview = response_text[:1000] + ('...' if len(response_text) > 1000 else '')
+               log_parts.append(f"Body: {body_preview}")
+       logger.info(' | '.join(log_parts))
+   def _check_single(self, endpoint):
+       """Выполняет один HTTP-запрос, возвращает (key, success)."""
+       host = endpoint.get('host')
+       port = endpoint.get('port')
+       path = endpoint.get('path', '/')
+       ssl = endpoint.get('ssl', self.defaults.get('ssl', 'auto'))
+       method = endpoint.get('method', self.defaults.get('method', 'GET')).upper()
+       expected_status = endpoint.get('expected_status', self.defaults.get('expected_status', 200))
+       check_content = endpoint.get('check_content', self.defaults.get('check_content'))
+       timeout = endpoint.get('timeout', self.defaults.get('timeout', 3))
+       headers = endpoint.get('headers', {}).copy()
+       body = endpoint.get('body')  # может быть строка или dict (будет преобразован в JSON)
+       log_level_override = endpoint.get('log_level')
+       # Определяем схему
+       if ssl == 'auto':
+           ssl_enabled = (port == 443)
+       else:
+           ssl_enabled = bool(ssl)
+       scheme = 'https' if ssl_enabled else 'http'
+       url = f"{scheme}://{host}:{port}{path}"
+       # Аутентификация
+       auth, secrets = self._get_auth(endpoint)
+        if auth is None and endpoint.get('auth_ref'):
+           # Если auth_ref не найден, возвращаем False
+           key = f"{self.prefix}.{host.split('.')[0] if '.' in host else host}.{port}.{method}.{normalize_path(path)}"
+           return key, False
+       # Подготовка тела (для POST)
+       request_data = None
+       if method == 'POST' and body:
+           if isinstance(body, dict):
+               request_data = json.dumps(body)
+           else:
+               request_data = body
+           if 'Content-Type' not in headers:
+               headers['Content-Type'] = 'application/json'
+       try:
+           response = requests.request(
+               method=method,
+               url=url,
+               headers=headers,
+               auth=auth,
+               timeout=timeout,
+               data=request_data,
+               verify=False,  # отключаем проверку сертификата
+           )
+           status_ok = response.status_code in (expected_status if isinstance(expected_status, list) else [expected_status])
+           content_ok = True
+           if check_content and status_ok:
+               if check_content.startswith('re:'):
+                   pattern = check_content[3:]
+                   content_ok = bool(re.search(pattern, response.text, re.IGNORECASE))
+                else:
+                   content_ok = check_content in response.text
+           success = status_ok and content_ok
+           # Логируем
+           self._log_request(
+               endpoint=endpoint,
+               method=method,
+                url=url,
+               status=response.status_code,
+               elapsed=response.elapsed.total_seconds(),
+               response_text=response.text if log_level_override == 'full' else '',
+               log_level_override=log_level_override
+            )
+       except requests.exceptions.Timeout:
+           self._log_request(endpoint, method, url, None, 0, error='Timeout', log_level_override=log_level_override)
+           success = False
+       except requests.exceptions.ConnectionError as e:
+           self._log_request(endpoint, method, url, None, 0, error=f'ConnectionError: {e}', log_level_override=log_level_override)
+           success = False
+       except Exception as e:
+           self._log_request(endpoint, method, url, None, 0, error=f'Exception: {e}', log_level_override=log_level_override)
+           success = False
+       # Формируем ключ
+       first_label = host.split('.')[0] if '.' in host else host
+       escaped_path = normalize_path(path)
+       key = f"{self.prefix}.{first_label}.{port}.{method}.{escaped_path}"
+       return key, success
+   def run(self):
+       """Основной метод модуля, вызываемый ядром S."""
+       results = {}
+       tasks = []
+       with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+           for endpoint in self.endpoints:
+               tasks.append(executor.submit(self._check_single, endpoint))
+           for future in as_completed(tasks):
+               try:
+                   key, success = future.result()
+                   results[key] = success
+               except Exception as e:
+                   logger.error(f"Unexpected error in http_check: {e}")
+       return results
+def run(config):
+   """Точка входа для ядра S."""
+   checker = HTTPChecker(config)
+   return checker.run()
+
+
+==================== FILE: ./src/modules/dns_check.yaml ====================
+prefix: "dns"
+hosts:
+#Балансировщик
+  - fqdn: "VVV-X9901AAA.my.company.com"
+    ip: "10.200.33.111"
+  - fqdn: "VVV-X9902AAA.my.company.com"
+    ip: "10.200.33.112"
+#Брокер
+  - fqdn: "VVV-X9901BBB.my.company.com"
+    ip: "10.200.33.113"
+
+#Прикладные
+  - fqdn: "VVV-X9901CCC.my.company.com"
+    ip: "10.200.33.133"
+
+timeout: 5
