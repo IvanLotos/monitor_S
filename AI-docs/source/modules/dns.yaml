@@ -1,7 +1,0 @@
-prefix: "dns"
-hosts:
-  - fqdn: "example.com"
-    ip: "93.184.216.34"
-  - fqdn: "google.com"
-    ip: "8.8.8.8"
-timeout: 5
