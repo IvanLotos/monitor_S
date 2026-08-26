@@ -1,0 +1,59 @@
+# Конфигурация модуля local_listener_check
+# Проверяет наличие портов на локальном интерфейсе удалённых хостов через агент мониторинга (mTLS).
+
+prefix: "listener"               # Префикс для ключей (можно переопределить)
+
+# Глобальные параметры mTLS (используются по умолчанию для всех хостов)
+cert_path: "/etc/ssl/default/client.crt"
+key_path: "/etc/ssl/default/client.key"
+ca_chain_path: "/etc/ssl/default/ca-chain.pem"
+
+# Глобальный порт агента (по умолчанию, если не переопределён для хоста)
+agent_port: 9500
+
+# Таймаут на один запрос (сек.)
+timeout: 5
+
+# Количество параллельных запросов к агентам
+max_workers: 20
+
+# Глобальный список портов для проверки (если не переопределены для хоста)
+ports:
+  - 22
+  - 8080
+  - 443
+
+# Список хостов для опроса
+hosts:
+  # Хост 1 — использует все глобальные настройки
+  - host: "host1.my.company.com"
+
+  # Хост 2 — переопределён порт агента (слушает на 9501)
+  - host: "host2.my.company.com"
+    agent_port: 9501
+
+  # Хост 3 — переопределён порт агента и список проверяемых портов
+  - host: "host3.my.company.com"
+    agent_port: 9502
+    ports:
+      - 22
+      - 9090
+      - 9100
+
+  # Хост 4 — полностью свои сертификаты (например, для изолированной зоны)
+  - host: "host4.secure.company.com"
+    agent_port: 9500
+    cert_path: "/etc/ssl/host4/client.crt"
+    key_path: "/etc/ssl/host4/client.key"
+    ca_chain_path: "/etc/ssl/host4/ca-chain.pem"
+    ports:
+      - 443
+      - 8443
+
+  # Хост 5 — переопределён порт и сертификаты
+  - host: "host5.internal.company.com"
+    agent_port: 9503
+    cert_path: "/etc/ssl/host5/client.crt"
+    key_path: "/etc/ssl/host5/client.key"
+    ca_chain_path: "/etc/ssl/host5/ca-chain.pem"
+    # порты берутся глобальные (22,8080,443)
