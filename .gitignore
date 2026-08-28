@@ -4,4 +4,6 @@ venv/
 .env
 tools/
 doc/ai-source/
+doc/old_vers/
+doc/*.html
 project_context.txt
